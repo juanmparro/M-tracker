@@ -57,6 +57,7 @@
     border:1px solid var(--line);border-radius:999px;padding:9px 16px;
   }
   button:active{background:#2a2a52}
+  button:disabled{opacity:.35}
   button.primary{background:var(--text);color:var(--bg);border-color:var(--text)}
   .cards{margin-top:22px;display:flex;flex-direction:column;gap:14px}
   .card{
@@ -82,6 +83,11 @@
   .bar i{display:block;height:100%;background:var(--hue)}
   .bar i.over{background:var(--alert)}
   .flag{margin-top:10px;font-size:12.5px;line-height:1.45;color:#ffd9de;background:rgba(255,107,127,.12);border:1px solid rgba(255,107,127,.35);border-radius:12px;padding:9px 11px}
+  .logbtn{
+    margin-top:12px;width:100%;background:transparent;color:var(--hue);
+    border:1px solid var(--hue);border-radius:12px;padding:11px 12px;font-weight:600;font-size:14px;
+  }
+  .logbtn:active{background:var(--hue);color:#14142a}
   details{margin-top:20px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
   summary{font-size:14px;font-weight:600;cursor:pointer;list-style:none}
   summary::-webkit-details-marker{display:none}
@@ -110,17 +116,19 @@
 <header>
   <span class="clock mono" id="clock"></span>
   <h1>Next dose</h1>
-  <div class="sub">Paste your log. It works out when each medicine is due again.</div>
+  <div class="sub">Tap a medicine when you take it. The log is kept on this phone and tells you when each one is due again.</div>
 </header>
 
 <label class="field" for="log">Your log</label>
 <textarea id="log" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="24/08&#10;23h: 4i 5p&#10;25/08&#10;04h: 4i 5p&#10;13h30: 1a 6i 5p"></textarea>
 <div class="row">
-  <button class="primary" id="paste">Paste log</button>
+  <button class="primary" id="paste">Paste</button>
   <button id="update">Update</button>
+  <button id="undo" disabled>Undo</button>
   <button id="clear">Clear</button>
-  <button id="sample">Load example</button>
+  <button id="sample">Example</button>
 </div>
+<div class="warn-parse" id="storeNote"></div>
 
 <div class="cards" id="cards"></div>
 <div class="warn-parse" id="parseNote"></div>
@@ -135,7 +143,8 @@
 
 <footer>
   Units read as written: <b>i</b> = 100 mg ibuprofen, <b>p</b> = 100 mg paracetamol, <b>a</b> = 1 antibiotic tablet.
-  Times can be written <b>13h</b>, <b>13h30</b>, <b>13:30</b> or <b>13.30</b>. Times without a date carry over from the last date line; times going backwards roll to the next day. The box empties every time you open the app.<br><br>
+  Times can be written <b>13h</b>, <b>13h30</b>, <b>13:30</b> or <b>13.30</b>. Times without a date carry over from the last date line; times going backwards roll to the next day.
+  The log stays on this phone between visits — nothing is sent anywhere. Use <b>Clear</b> when the course is over.<br><br>
   This is a timer, not medical advice. Follow your prescription, and contact your dentist or doctor if pain or swelling gets worse, or if you have kidney, liver, stomach, heart or asthma problems, are pregnant, or drink alcohol daily.
 </footer>
 
@@ -308,7 +317,9 @@ function render(){
     const flag = taken24>cfg.max24
       ? `<div class="flag">You have had ${cfg.unit===1?taken24+" tablets":taken24+" mg"} in the last 24 hours, above the ${cfg.unit===1?cfg.max24+" tablets":cfg.max24+" mg"} limit set here. Check with your dentist or pharmacist before the next dose.</div>` : "";
 
-    el.innerHTML=head+body+ribbon+meter+flag;
+    const btn=`<button class="logbtn" data-add="${key}">Took ${unitTxt(cfg.dose)} just now</button>`;
+
+    el.innerHTML=head+body+ribbon+meter+flag+btn;
     cards.appendChild(el);
   });
 
@@ -362,27 +373,87 @@ const SAMPLE=`24/08
 22h: 5p`;
 
 const ta=document.getElementById("log");
-function update(){ state=parseLog(ta.value); render(); }
-function flush(){ ta.value=""; update(); }
+const KEY="doseTimer.v3";
+const undoStack=[];
 
+/* ---------- persistence ---------- */
+function save(){
+  const cfg={};
+  ORDER.forEach(k=>cfg[k]={dose:MEDS[k].dose, gap:MEDS[k].gap, max24:MEDS[k].max24});
+  try{ localStorage.setItem(KEY, JSON.stringify({log:ta.value, cfg})); }
+  catch(e){ document.getElementById("storeNote").textContent=
+    "This browser will not let the log be saved, so it is kept only until you close the page."; }
+}
+function restore(){
+  let saved=null;
+  try{ saved=JSON.parse(localStorage.getItem(KEY)||"null"); }catch(e){}
+  if(!saved) return;
+  if(typeof saved.log==="string") ta.value=saved.log;
+  if(saved.cfg) ORDER.forEach(k=>{
+    const c=saved.cfg[k]; if(!c) return;
+    ["dose","gap","max24"].forEach(f=>{ if(typeof c[f]==="number"&&c[f]>0) MEDS[k][f]=c[f]; });
+  });
+}
+
+function update(){ state=parseLog(ta.value); render(); save(); refreshUndo(); }
+function refreshUndo(){ document.getElementById("undo").disabled = undoStack.length===0; }
+function remember(){ undoStack.push(ta.value); if(undoStack.length>30) undoStack.shift(); }
+
+/* ---------- one-tap entry ---------- */
+function addDose(key){
+  const cfg=MEDS[key], now=new Date();
+  const qty = cfg.unit===1 ? cfg.dose : cfg.dose/cfg.unit;
+  const token = (Math.round(qty*100)/100) + key;
+  const p2=n=>String(n).padStart(2,"0");
+  const stamp=`${p2(now.getHours())}:${p2(now.getMinutes())}`;
+  const dateLine=`${p2(now.getDate())}/${p2(now.getMonth()+1)}`;
+
+  remember();
+  const lines=ta.value.split(/\r?\n/);
+  while(lines.length && !lines[lines.length-1].trim()) lines.pop();
+
+  const lastDose = state.doses.length ? state.doses[state.doses.length-1].t : null;
+  const sameDay = lastDose && lastDose.toDateString()===now.toDateString();
+  const lastLine = lines.length ? lines[lines.length-1].trim() : "";
+
+  if(lastLine.startsWith(stamp+":")) lines[lines.length-1]=lastLine+" "+token;
+  else{
+    if(!lines.length || !sameDay) lines.push(dateLine);
+    lines.push(`${stamp}: ${token}`);
+  }
+  ta.value=lines.join("\n");
+  update();
+}
+
+document.getElementById("cards").addEventListener("click",e=>{
+  const b=e.target.closest("[data-add]"); if(b) addDose(b.dataset.add);
+});
+document.getElementById("undo").addEventListener("click",()=>{
+  if(!undoStack.length) return;
+  ta.value=undoStack.pop(); update();
+});
 document.getElementById("update").addEventListener("click",()=>{ ta.blur(); update(); });
-document.getElementById("clear").addEventListener("click",flush);
-document.getElementById("sample").addEventListener("click",()=>{ ta.value=SAMPLE; update(); });
+document.getElementById("clear").addEventListener("click",()=>{
+  if(!ta.value.trim() || confirm("Erase the whole log?")){ remember(); ta.value=""; update(); }
+});
+document.getElementById("sample").addEventListener("click",()=>{
+  if(!ta.value.trim() || confirm("Replace the log with the example?")){ remember(); ta.value=SAMPLE; update(); }
+});
 document.getElementById("paste").addEventListener("click", async ()=>{
   try{
     const txt=await navigator.clipboard.readText();
-    if(txt && txt.trim()){ ta.value=txt.trim(); update(); }
+    if(txt && txt.trim()){ remember(); ta.value=txt.trim(); update(); }
   }catch(e){
     document.getElementById("parseNote").textContent=
       "Safari blocked the clipboard here. Tap the box and hold to paste instead.";
   }
 });
 ta.addEventListener("input",update);
+window.addEventListener("pagehide",save);
 
-// start blank every time, including when Safari restores the page from cache
-window.addEventListener("pageshow",flush);
+restore();
 buildGrid();
-flush();
+update();
 setInterval(tick,1000);
 </script>
 </body>
